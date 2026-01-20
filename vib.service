@@ -1,0 +1,16 @@
+[Unit]
+Description=VIB - Remote Development Bridge Daemon
+Documentation=https://github.com/nithin/vib
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/nithin/vib/vib daemon
+Restart=on-failure
+RestartSec=5
+
+# Environment
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
