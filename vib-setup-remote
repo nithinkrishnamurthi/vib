@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+#
+# Setup script for vib on remote machines
+# Adds openpr and curs aliases to ~/.zshrc
+#
+
+ZSHRC="$HOME/.zshrc"
+VIB_MARKER="# vib aliases"
+
+# Check if already installed
+if grep -q "$VIB_MARKER" "$ZSHRC" 2>/dev/null; then
+    echo "vib aliases already installed in $ZSHRC"
+    exit 0
+fi
+
+# Append aliases
+cat >> "$ZSHRC" << 'EOF'
+
+# vib aliases
+alias openpr='vib openpr'
+alias curs='vib curs'
+EOF
+
+echo "Added openpr and curs aliases to $ZSHRC"
+echo "Run 'source ~/.zshrc' or start a new shell to use them"
