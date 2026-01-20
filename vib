@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 
@@ -54,6 +55,29 @@ def parse_ssh_config():
         return mapping
     except Exception:
         return {}
+
+
+def get_config_host():
+    """Get the SSH host alias from ~/.vib/config on the remote.
+
+    Format:
+        host = anton
+    """
+    if not CONFIG_FILE.exists():
+        return None
+
+    try:
+        for line in CONFIG_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.lower().startswith("host"):
+                # "host = anton" or "host=anton"
+                if "=" in line:
+                    return line.split("=", 1)[1].strip()
+        return None
+    except Exception:
+        return None
 
 
 def resolve_hostname_to_ips(hostname: str) -> list:
@@ -142,6 +166,107 @@ def get_remote_host():
         return result.stdout.strip()
     except subprocess.CalledProcessError:
         return socket.gethostname()
+
+
+class TunnelManager:
+    """Manages SSH tunnel with automatic reconnection."""
+
+    def __init__(self, host: str, local_socket: Path, stop_event: threading.Event):
+        self.host = host
+        self.local_socket = local_socket
+        self.remote_socket = f"/tmp/vib-{os.environ.get('USER', 'unknown')}.sock"
+        self.stop_event = stop_event
+        self.process = None
+        self.backoff = 1  # Start with 1 second
+        self.max_backoff = 60  # Max 60 seconds
+
+    def _build_ssh_command(self) -> list:
+        """Build the SSH command for reverse forwarding."""
+        return [
+            "ssh",
+            "-N",  # No remote command
+            "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveCountMax=3",
+            "-o", "ExitOnForwardFailure=yes",
+            "-o", "BatchMode=yes",  # Don't prompt for password
+            "-R", f"{self.remote_socket}:{self.local_socket}",
+            self.host,
+        ]
+
+    def _start_ssh(self) -> bool:
+        """Start the SSH subprocess. Returns True if started successfully."""
+        cmd = self._build_ssh_command()
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            # Give SSH a moment to establish or fail
+            time.sleep(1)
+
+            if self.process.poll() is not None:
+                # Process already exited
+                stderr = self.process.stderr.read().decode().strip() if self.process.stderr else ""
+                print(f"SSH tunnel failed to start: {stderr}")
+                return False
+
+            print(f"SSH tunnel established to {self.host}")
+            self.backoff = 1  # Reset backoff on success
+            return True
+        except Exception as e:
+            print(f"Failed to start SSH: {e}")
+            return False
+
+    def _wait_for_exit(self) -> int:
+        """Wait for SSH process to exit. Returns exit code."""
+        if self.process is None:
+            return -1
+
+        while not self.stop_event.is_set():
+            try:
+                exit_code = self.process.wait(timeout=1)
+                stderr = self.process.stderr.read().decode().strip() if self.process.stderr else ""
+                if stderr:
+                    print(f"SSH tunnel closed: {stderr}")
+                else:
+                    print(f"SSH tunnel closed (exit code {exit_code})")
+                return exit_code
+            except subprocess.TimeoutExpired:
+                continue
+
+        return 0
+
+    def run(self):
+        """Main loop: start SSH, monitor, reconnect on failure."""
+        print(f"Starting tunnel manager for {self.host}...")
+
+        while not self.stop_event.is_set():
+            if self._start_ssh():
+                self._wait_for_exit()
+
+            if self.stop_event.is_set():
+                break
+
+            print(f"Reconnecting in {self.backoff}s...")
+            # Wait with stop_event check
+            for _ in range(self.backoff):
+                if self.stop_event.is_set():
+                    return
+                time.sleep(1)
+
+            # Exponential backoff
+            self.backoff = min(self.backoff * 2, self.max_backoff)
+
+    def stop(self):
+        """Stop the SSH tunnel."""
+        if self.process and self.process.poll() is None:
+            print("Terminating SSH tunnel...")
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
 
 
 def send_to_daemon(message: dict, socket_path: Path = REMOTE_SOCKET) -> dict:
@@ -332,8 +457,12 @@ def run_socket_listener(sock, stop_event):
                 print(f"Socket error: {e}")
 
 
-def run_daemon():
-    """Run the daemon that listens for commands."""
+def run_daemon(tunnel_host: str = None):
+    """Run the daemon that listens for commands.
+
+    Args:
+        tunnel_host: If provided, establish SSH tunnel to this host with reverse forwarding
+    """
     # Ensure socket directory exists
     LOCAL_SOCKET.parent.mkdir(parents=True, exist_ok=True)
 
@@ -349,10 +478,23 @@ def run_daemon():
     os.chmod(LOCAL_SOCKET, 0o600)
 
     print(f"VIB daemon listening on {LOCAL_SOCKET}")
-    print(f"Add to ~/.ssh/config: RemoteForward /tmp/vib-$USER.sock {LOCAL_SOCKET}")
-    print("Press Ctrl+C to stop...")
 
     stop_event = threading.Event()
+    tunnel_manager = None
+
+    # Start tunnel if host specified
+    if tunnel_host:
+        print(f"Establishing SSH tunnel to {tunnel_host}...")
+        tunnel_manager = TunnelManager(tunnel_host, LOCAL_SOCKET, stop_event)
+        tunnel_thread = threading.Thread(
+            target=tunnel_manager.run,
+            daemon=True,
+        )
+        tunnel_thread.start()
+    else:
+        print(f"Add to ~/.ssh/config: RemoteForward /tmp/vib-$USER.sock {LOCAL_SOCKET}")
+
+    print("Press Ctrl+C to stop...")
 
     # Start socket listener in a thread
     listener_thread = threading.Thread(
@@ -362,13 +504,24 @@ def run_daemon():
     )
     listener_thread.start()
 
+    # Set up signal handlers for graceful shutdown
+    def handle_signal(signum, frame):
+        print(f"\nReceived signal {signum}, shutting down...")
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
     try:
-        while True:
+        while not stop_event.is_set():
             signal.pause()
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        pass
     finally:
+        print("Shutting down...")
         stop_event.set()
+        if tunnel_manager:
+            tunnel_manager.stop()
         sock.close()
         if LOCAL_SOCKET.exists():
             LOCAL_SOCKET.unlink()
@@ -376,7 +529,93 @@ def run_daemon():
 
 def cmd_daemon(args):
     """Handle 'vib daemon' command."""
-    run_daemon()
+    tunnel_host = None
+
+    if args.tunnel is not None:
+        if args.tunnel:
+            # Explicit host provided: --tunnel gpu
+            tunnel_host = args.tunnel
+        else:
+            # Just --tunnel with no argument, read from config
+            tunnel_host = get_config_host()
+            if not tunnel_host:
+                print("Error: No host specified and no host in ~/.vib/config", file=sys.stderr)
+                print("Usage: vib daemon --tunnel HOST  or  set 'host = yourhost' in ~/.vib/config", file=sys.stderr)
+                sys.exit(1)
+
+    run_daemon(tunnel_host=tunnel_host)
+
+
+def cmd_install(args):
+    """Handle 'vib install' command - set up systemd user service."""
+    import shutil
+
+    # Check for systemd
+    if not shutil.which("systemctl"):
+        print("Error: systemctl not found. Is systemd installed?", file=sys.stderr)
+        sys.exit(1)
+
+    # Get the host for the tunnel
+    host = args.host if args.host else get_config_host()
+    if not host:
+        print("Error: No host specified and no host in ~/.vib/config", file=sys.stderr)
+        print("Usage: vib install HOST  or  set 'host = yourhost' in ~/.vib/config first", file=sys.stderr)
+        sys.exit(1)
+
+    # Get path to this script
+    vib_path = os.path.abspath(__file__)
+
+    # Create systemd user directory
+    systemd_dir = Path.home() / ".config" / "systemd" / "user"
+    systemd_dir.mkdir(parents=True, exist_ok=True)
+
+    service_file = systemd_dir / "vib.service"
+
+    # Create service file content
+    service_content = f"""[Unit]
+Description=VIB Remote Development Bridge
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={vib_path} daemon --tunnel {host}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+"""
+
+    # Write service file
+    service_file.write_text(service_content)
+    print(f"Created {service_file}")
+
+    # Run systemctl commands
+    commands = [
+        (["systemctl", "--user", "daemon-reload"], "Reloading systemd..."),
+        (["systemctl", "--user", "enable", "vib"], "Enabling vib service..."),
+        (["systemctl", "--user", "restart", "vib"], "Starting vib service..."),
+    ]
+
+    for cmd, msg in commands:
+        print(msg)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"Error: {result.stderr.strip()}", file=sys.stderr)
+            sys.exit(1)
+
+    # Print status
+    print("\nVIB service installed and started!")
+    print(f"Tunnel target: {host}")
+    print("\nUseful commands:")
+    print("  systemctl --user status vib    # Check status")
+    print("  journalctl --user -u vib -f    # View logs")
+    print("  systemctl --user restart vib   # Restart service")
+    print("  systemctl --user stop vib      # Stop service")
+
+    # Show current status
+    print("\nCurrent status:")
+    subprocess.run(["systemctl", "--user", "status", "vib", "--no-pager"])
 
 
 def cmd_openpr(args):
@@ -417,8 +656,8 @@ def cmd_curs(args):
     path = args.path if args.path else os.getcwd()
     path = os.path.abspath(path)
 
-    # Get remote host info (daemon will resolve to SSH config alias)
-    host = os.environ.get("VIB_HOST") or get_remote_host()
+    # Get remote host info (priority: ~/.vib/config > VIB_HOST env > auto-detect)
+    host = get_config_host() or os.environ.get("VIB_HOST") or get_remote_host()
     user = os.environ.get("USER")
 
     message = {
@@ -445,18 +684,28 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  Local machine:
-    vib daemon              Start daemon (add RemoteForward to SSH config)
+  Local machine setup (one-time):
+    vib install anton       Install as systemd service with tunnel to 'anton'
+    vib install             Use host from ~/.vib/config
 
-  Remote machine (via SSH with socket forwarding):
+  Local machine (manual):
+    vib daemon --tunnel anton   Start daemon with SSH tunnel to 'anton'
+    vib daemon --tunnel         Use host from ~/.vib/config
+    vib daemon                  Start daemon only (manual SSH forwarding)
+
+  Remote machine (via SSH):
     vib openpr              Open GitHub PR creation page for current branch
     vib curs                Open Cursor connected to current directory
     vib curs /path/to/dir   Open Cursor connected to specific directory
     vib curs --diff         Open Cursor with Source Control view focused
 
-  SSH config (~/.ssh/config):
-    Host myserver
-      RemoteForward /tmp/vib-myuser.sock /home/myuser/.vib/vib.sock
+  Config file (~/.vib/config):
+    host = anton            Default SSH host for tunnel
+
+  Service management:
+    systemctl --user status vib     Check service status
+    journalctl --user -u vib -f     View logs
+    systemctl --user restart vib    Restart service
         """,
     )
 
@@ -464,7 +713,19 @@ Examples:
 
     # daemon command
     daemon_parser = subparsers.add_parser("daemon", help="Start the local daemon")
+    daemon_parser.add_argument(
+        "--tunnel", nargs="?", const="", default=None, metavar="HOST",
+        help="Establish SSH tunnel to HOST (uses ~/.vib/config if HOST not specified)"
+    )
     daemon_parser.set_defaults(func=cmd_daemon)
+
+    # install command
+    install_parser = subparsers.add_parser("install", help="Install as systemd user service")
+    install_parser.add_argument(
+        "host", nargs="?", default=None,
+        help="SSH host to tunnel to (uses ~/.vib/config if not specified)"
+    )
+    install_parser.set_defaults(func=cmd_install)
 
     # openpr command
     openpr_parser = subparsers.add_parser("openpr", help="Open GitHub PR creation page")
