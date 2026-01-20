@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+#
+# Install vib daemon as a launchd service on macOS
+# Run with: sudo ./vib-install-macos
+#
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VIB_SRC="$SCRIPT_DIR/vib"
+VIB_DEST="/usr/local/bin/vib"
+PLIST_NAME="com.vib.daemon.plist"
+PLIST_DEST="$HOME/Library/LaunchAgents/$PLIST_NAME"
+
+# Get the actual user (not root when running with sudo)
+ACTUAL_USER="${SUDO_USER:-$USER}"
+ACTUAL_HOME=$(eval echo "~$ACTUAL_USER")
+PLIST_DEST="$ACTUAL_HOME/Library/LaunchAgents/$PLIST_NAME"
+
+echo "Installing vib daemon for user: $ACTUAL_USER"
+
+# Check if vib source exists
+if [[ ! -f "$VIB_SRC" ]]; then
+    echo "Error: vib not found in $SCRIPT_DIR"
+    exit 1
+fi
+
+# Copy vib to /usr/local/bin
+echo "Copying vib to $VIB_DEST..."
+cp "$VIB_SRC" "$VIB_DEST"
+chmod +x "$VIB_DEST"
+
+# Create LaunchAgents directory if needed
+mkdir -p "$ACTUAL_HOME/Library/LaunchAgents"
+
+# Unload existing service if present
+if launchctl list 2>/dev/null | grep -q "com.vib.daemon"; then
+    echo "Stopping existing vib daemon..."
+    sudo -u "$ACTUAL_USER" launchctl unload "$PLIST_DEST" 2>/dev/null || true
+fi
+
+# Create plist file
+echo "Creating launchd plist..."
+cat > "$PLIST_DEST" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.vib.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/vib</string>
+        <string>daemon</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/vib.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/vib.err</string>
+</dict>
+</plist>
+EOF
+
+# Fix ownership of plist
+chown "$ACTUAL_USER" "$PLIST_DEST"
+
+# Load the service as the actual user
+echo "Starting vib daemon..."
+sudo -u "$ACTUAL_USER" launchctl load "$PLIST_DEST"
+
+echo ""
+echo "vib daemon installed and running!"
+echo ""
+echo "Useful commands:"
+echo "  Check status:  launchctl list | grep vib"
+echo "  View logs:     tail -f /tmp/vib.log"
+echo "  Stop:          launchctl unload ~/Library/LaunchAgents/$PLIST_NAME"
+echo "  Start:         launchctl load ~/Library/LaunchAgents/$PLIST_NAME"
