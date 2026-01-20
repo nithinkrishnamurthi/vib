@@ -176,10 +176,33 @@ def handle_curs_daemon(data: dict) -> dict:
     else:
         remote_id = host
 
+    # Find cursor binary - check PATH first, then common macOS locations
+    cursor_paths = [
+        "cursor",  # Check PATH first
+        "/Applications/Cursor.app/Contents/Resources/app/bin/cursor",
+        "/usr/local/bin/cursor",
+        os.path.expanduser("~/Applications/Cursor.app/Contents/Resources/app/bin/cursor"),
+    ]
+
+    cursor_bin = None
+    for cp in cursor_paths:
+        if cp == "cursor":
+            # Check if cursor is in PATH
+            import shutil
+            if shutil.which("cursor"):
+                cursor_bin = "cursor"
+                break
+        elif os.path.exists(cp):
+            cursor_bin = cp
+            break
+
+    if not cursor_bin:
+        return {"status": "error", "message": "Cursor not found. Install Cursor or check installation path."}
+
     try:
         # Open Cursor with SSH remote
         subprocess.Popen(
-            ["cursor", "--remote", f"ssh-remote+{remote_id}", path],
+            [cursor_bin, "--remote", f"ssh-remote+{remote_id}", path],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -190,7 +213,7 @@ def handle_curs_daemon(data: dict) -> dict:
             import time
             time.sleep(2)
             subprocess.Popen(
-                ["cursor", "--goto", "scm"],
+                [cursor_bin, "--goto", "scm"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -198,7 +221,7 @@ def handle_curs_daemon(data: dict) -> dict:
 
         return {"status": "ok", "remote": remote_id, "path": path, "diff": diff}
     except FileNotFoundError:
-        return {"status": "error", "message": "Cursor not found in PATH"}
+        return {"status": "error", "message": "Cursor not found"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
