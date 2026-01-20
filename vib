@@ -142,8 +142,8 @@ def handle_openpr_daemon(data: dict) -> dict:
     pr_url = f"https://github.com/{owner}/{repo}/compare/{branch}?expand=1"
 
     try:
-        # Try different browser commands
-        for browser in ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "xdg-open"]:
+        # Try different browser commands (macOS uses 'open', Linux uses xdg-open or specific browsers)
+        for browser in ["open", "xdg-open", "google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]:
             try:
                 subprocess.Popen(
                     [browser, pr_url],
