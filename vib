@@ -21,6 +21,70 @@ from pathlib import Path
 VIB_DIR = Path.home() / ".vib"
 LOCAL_SOCKET = VIB_DIR / "vib.sock"
 REMOTE_SOCKET = Path(f"/tmp/vib-{os.environ.get('USER', 'unknown')}.sock")
+CONFIG_FILE = VIB_DIR / "config"
+
+
+def parse_ssh_config():
+    """Parse ~/.ssh/config and return a mapping of HostName -> Host alias."""
+    ssh_config = Path.home() / ".ssh" / "config"
+    if not ssh_config.exists():
+        return {}
+
+    mapping = {}
+    current_host = None
+
+    try:
+        for line in ssh_config.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            # Match "Host alias" (but not wildcard patterns)
+            if line.lower().startswith("host ") and not line.lower().startswith("hostname"):
+                alias = line.split(None, 1)[1].strip()
+                if "*" not in alias and "?" not in alias:
+                    current_host = alias
+                else:
+                    current_host = None
+            # Match "HostName actual.hostname.com"
+            elif line.lower().startswith("hostname") and current_host:
+                hostname = line.split(None, 1)[1].strip() if len(line.split(None, 1)) > 1 else None
+                if hostname:
+                    mapping[hostname] = current_host
+        return mapping
+    except Exception:
+        return {}
+
+
+def resolve_hostname_to_ips(hostname: str) -> list:
+    """Resolve a hostname to its IP addresses."""
+    try:
+        results = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        return list(set(r[4][0] for r in results))
+    except socket.gaierror:
+        return []
+
+
+def resolve_host_alias(host: str) -> str:
+    """Resolve an IP/hostname to an SSH config Host alias.
+
+    Parses ~/.ssh/config, resolves each HostName to IPs,
+    and matches against the incoming host.
+    """
+    # Get mapping of HostName -> Host alias from SSH config
+    ssh_mapping = parse_ssh_config()
+
+    # Direct match on hostname
+    if host in ssh_mapping:
+        return ssh_mapping[host]
+
+    # Resolve each HostName to IPs and check for match
+    for hostname, alias in ssh_mapping.items():
+        ips = resolve_hostname_to_ips(hostname)
+        if host in ips:
+            return alias
+
+    return host
 
 
 def get_git_branch():
@@ -170,8 +234,16 @@ def handle_curs_daemon(data: dict) -> dict:
     if not host or not path:
         return {"status": "error", "message": "Missing host or path"}
 
-    # Build remote identifier
-    if user:
+    # Resolve host to SSH config alias (e.g., "192.168.0.35" -> "anton")
+    host_alias = resolve_host_alias(host)
+    if host_alias != host:
+        print(f"Resolved {host} -> {host_alias}")
+
+    # Build remote identifier using the alias (don't include user if using alias)
+    if host_alias != host:
+        # Using SSH config alias - it already has user configured
+        remote_id = host_alias
+    elif user:
         remote_id = f"{user}@{host}"
     else:
         remote_id = host
@@ -345,8 +417,8 @@ def cmd_curs(args):
     path = args.path if args.path else os.getcwd()
     path = os.path.abspath(path)
 
-    # Get remote host info
-    host = get_remote_host()
+    # Get remote host info (daemon will resolve to SSH config alias)
+    host = os.environ.get("VIB_HOST") or get_remote_host()
     user = os.environ.get("USER")
 
     message = {
