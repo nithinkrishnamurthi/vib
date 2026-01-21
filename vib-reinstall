@@ -37,6 +37,11 @@ reinstall_macos() {
         launchctl unload "$PLIST_PATH" 2>/dev/null || true
     fi
 
+    # Remove stale sockets
+    echo "Removing stale sockets..."
+    rm -f "$HOME/.vib/vib.sock"
+    rm -f "/tmp/vib-$USER.sock"
+
     # Remove old plist
     if [[ -f "$PLIST_PATH" ]]; then
         echo "Removing old plist..."
@@ -111,6 +116,11 @@ reinstall_linux() {
         echo "Disabling vib service..."
         systemctl --user disable "$SERVICE_NAME" || true
     fi
+
+    # Remove stale sockets
+    echo "Removing stale sockets..."
+    rm -f "$HOME/.vib/vib.sock"
+    rm -f "/tmp/vib-$USER.sock"
 
     # Copy vib to destination
     echo "Copying vib to $VIB_DEST..."
