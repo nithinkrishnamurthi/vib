@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+#
+# Reinstall vib daemon - cross-platform (macOS and Linux)
+# Stops the existing daemon, reinstalls the binary, and restarts the daemon
+#
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VIB_SRC="$SCRIPT_DIR/vib"
+
+# Check if vib source exists
+if [[ ! -f "$VIB_SRC" ]]; then
+    echo "Error: vib not found in $SCRIPT_DIR"
+    exit 1
+fi
+
+detect_os() {
+    case "$(uname -s)" in
+        Darwin) echo "macos" ;;
+        Linux)  echo "linux" ;;
+        *)      echo "unknown" ;;
+    esac
+}
+
+reinstall_macos() {
+    local PLIST_NAME="com.vib.daemon.plist"
+    local PLIST_PATH="$HOME/Library/LaunchAgents/$PLIST_NAME"
+    local VIB_DEST="/usr/local/bin/vib"
+
+    echo "Detected macOS"
+    echo ""
+
+    # Stop daemon if running
+    if launchctl list 2>/dev/null | grep -q "com.vib.daemon"; then
+        echo "Stopping vib daemon..."
+        launchctl unload "$PLIST_PATH" 2>/dev/null || true
+    fi
+
+    # Remove old plist
+    if [[ -f "$PLIST_PATH" ]]; then
+        echo "Removing old plist..."
+        rm -f "$PLIST_PATH"
+    fi
+
+    # Copy vib to /usr/local/bin
+    echo "Copying vib to $VIB_DEST..."
+    sudo cp "$VIB_SRC" "$VIB_DEST"
+    sudo chmod +x "$VIB_DEST"
+
+    # Create LaunchAgents directory if needed
+    mkdir -p "$HOME/Library/LaunchAgents"
+
+    # Recreate plist file
+    echo "Creating launchd plist..."
+    cat > "$PLIST_PATH" << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.vib.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/vib</string>
+        <string>daemon</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/vib.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/vib.err</string>
+</dict>
+</plist>
+EOF
+
+    # Start daemon
+    echo "Starting vib daemon..."
+    launchctl load "$PLIST_PATH"
+
+    echo ""
+    echo "vib reinstalled successfully!"
+    echo "Check status: launchctl list | grep vib"
+}
+
+reinstall_linux() {
+    local SERVICE_NAME="vib"
+    local SERVICE_FILE="$HOME/.config/systemd/user/vib.service"
+    local VIB_DEST
+
+    echo "Detected Linux"
+    echo ""
+
+    # Determine vib destination from existing service file, or use default
+    if [[ -f "$SERVICE_FILE" ]]; then
+        VIB_DEST=$(grep -oP 'ExecStart=\K[^ ]+' "$SERVICE_FILE" || echo "")
+    fi
+    if [[ -z "$VIB_DEST" ]]; then
+        VIB_DEST="/usr/bin/vib"
+    fi
+
+    # Stop and disable service if exists
+    if systemctl --user is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        echo "Stopping vib service..."
+        systemctl --user stop "$SERVICE_NAME" || true
+    fi
+    if systemctl --user is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
+        echo "Disabling vib service..."
+        systemctl --user disable "$SERVICE_NAME" || true
+    fi
+
+    # Copy vib to destination
+    echo "Copying vib to $VIB_DEST..."
+    sudo cp "$VIB_SRC" "$VIB_DEST"
+    sudo chmod +x "$VIB_DEST"
+
+    # Create systemd user directory if needed
+    mkdir -p "$HOME/.config/systemd/user"
+
+    # Create/update service file
+    echo "Creating systemd service file..."
+    cat > "$SERVICE_FILE" << EOF
+[Unit]
+Description=VIB - Remote Development Bridge Daemon
+Documentation=https://github.com/nithin/vib
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$VIB_DEST daemon
+Restart=on-failure
+RestartSec=5
+
+# Environment
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
+EOF
+
+    # Reload and restart
+    echo "Reloading systemd..."
+    systemctl --user daemon-reload
+
+    echo "Enabling vib service..."
+    systemctl --user enable "$SERVICE_NAME"
+
+    echo "Starting vib service..."
+    systemctl --user restart "$SERVICE_NAME"
+
+    echo ""
+    echo "vib reinstalled successfully!"
+    echo "Check status: systemctl --user status vib"
+}
+
+OS=$(detect_os)
+
+case "$OS" in
+    macos)
+        reinstall_macos
+        ;;
+    linux)
+        reinstall_linux
+        ;;
+    *)
+        echo "Error: Unsupported operating system"
+        exit 1
+        ;;
+esac

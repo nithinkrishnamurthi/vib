@@ -1,10 +1,31 @@
 #!/usr/bin/env bash
 #
 # Setup script for vib on remote machines
-# Adds openpr and curs aliases to ~/.bashrc and ~/.zshrc
+# - Copies vib binary to /usr/bin
+# - Adds openpr and curs aliases to ~/.bashrc and ~/.zshrc
 #
 
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VIB_SRC="$SCRIPT_DIR/vib"
+VIB_DEST="/usr/bin/vib"
+
 VIB_MARKER="# vib aliases"
+
+# Install vib binary
+install_vib() {
+    if [[ -f "$VIB_SRC" ]]; then
+        echo "Installing vib binary to $VIB_DEST..."
+        sudo cp "$VIB_SRC" "$VIB_DEST"
+        sudo chmod +x "$VIB_DEST"
+        echo "vib installed to $VIB_DEST"
+    else
+        echo "Warning: vib binary not found in $SCRIPT_DIR"
+        echo "Skipping binary installation, only setting up aliases"
+    fi
+}
+
 ALIASES='
 # vib aliases
 alias openpr="vib openpr"
@@ -23,8 +44,16 @@ add_aliases() {
     fi
 }
 
+# Install vib binary first
+install_vib
+
+echo ""
+
 # Add to both bashrc and zshrc
 add_aliases "$HOME/.bashrc" create
 add_aliases "$HOME/.zshrc"
 
-echo "Run 'source ~/.bashrc' or start a new shell to use them"
+echo ""
+echo "Setup complete!"
+echo "Run 'source ~/.bashrc' or start a new shell to use the aliases"
+echo "Verify installation: which vib"
