@@ -255,6 +255,7 @@ class TunnelManager:
             "-o", "ServerAliveCountMax=3",
             "-o", "ExitOnForwardFailure=yes",
             "-o", "BatchMode=yes",  # Don't prompt for password
+            "-o", "StreamLocalBindUnlink=yes",  # Remove stale socket before binding
             "-R", f"{self.remote_socket}:{self.local_socket}",
             self.host,
         ]

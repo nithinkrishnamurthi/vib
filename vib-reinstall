@@ -27,9 +27,22 @@ reinstall_macos() {
     local PLIST_NAME="com.vib.daemon.plist"
     local PLIST_PATH="$HOME/Library/LaunchAgents/$PLIST_NAME"
     local VIB_DEST="/usr/local/bin/vib"
+    local CONFIG_FILE="$HOME/.vib/config"
+    local TUNNEL_HOST=""
 
     echo "Detected macOS"
     echo ""
+
+    # Read tunnel host from config
+    if [[ -f "$CONFIG_FILE" ]]; then
+        TUNNEL_HOST=$(grep -i '^host' "$CONFIG_FILE" | sed 's/.*=\s*//' | tr -d ' ' || true)
+    fi
+    if [[ -z "$TUNNEL_HOST" ]]; then
+        echo "Error: No host configured in ~/.vib/config"
+        echo "Add 'host = yourhostname' to ~/.vib/config first"
+        exit 1
+    fi
+    echo "Tunnel host: $TUNNEL_HOST"
 
     # Stop daemon if running
     if launchctl list 2>/dev/null | grep -q "com.vib.daemon"; then
@@ -58,7 +71,7 @@ reinstall_macos() {
 
     # Recreate plist file
     echo "Creating launchd plist..."
-    cat > "$PLIST_PATH" << 'EOF'
+    cat > "$PLIST_PATH" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -69,6 +82,8 @@ reinstall_macos() {
     <array>
         <string>/usr/local/bin/vib</string>
         <string>daemon</string>
+        <string>--tunnel</string>
+        <string>$TUNNEL_HOST</string>
     </array>
     <key>RunAtLoad</key>
     <true/>

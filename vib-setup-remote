@@ -9,7 +9,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VIB_SRC="$SCRIPT_DIR/vib"
-VIB_DEST="/usr/bin/vib"
+VIB_DEST="/usr/local/bin/vib"
 
 VIB_MARKER="# vib aliases"
 
