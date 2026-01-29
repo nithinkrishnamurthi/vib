@@ -644,6 +644,7 @@ def handle_iosbuild_daemon(data: dict) -> dict:
     """Handle iosbuild request - pull branch and run build in new terminal."""
     branch = data.get("branch")
     repo_url = data.get("repo_url")
+    build_args = data.get("build_args", [])
 
     if not branch:
         return {"status": "error", "message": "Missing branch"}
@@ -652,6 +653,10 @@ def handle_iosbuild_daemon(data: dict) -> dict:
     config = get_iosbuild_config()
     base_path = config["path"]
     command = config["command"]
+
+    # Append any extra build arguments
+    if build_args:
+        command = f"{command} {' '.join(build_args)}"
 
     if not base_path:
         return {"status": "error", "message": "iosbuild_path not configured in ~/.vib/config"}
@@ -1027,6 +1032,7 @@ def cmd_iosbuild(args):
         "action": "iosbuild",
         "branch": branch,
         "repo_url": repo_url,
+        "build_args": args.build_args,
     }
 
     print("Triggering iOS build...")
@@ -1065,6 +1071,7 @@ Examples:
     vib curs --diff         Open Cursor with Source Control view focused
     vib iosbuild            Push changes and trigger iOS build on client
     vib iosbuild --no-push  Trigger build without pushing (already pushed)
+    vib iosbuild --clean    Pass --clean flag to the build script
 
   Config file (~/.vib/config):
     host = anton            Default SSH host for tunnel
@@ -1116,11 +1123,17 @@ Examples:
     )
     iosbuild_parser.set_defaults(func=cmd_iosbuild)
 
-    args = parser.parse_args()
+    args, remaining = parser.parse_known_args()
 
     if not args.command:
         parser.print_help()
         sys.exit(1)
+
+    # Pass remaining unknown args as build_args for iosbuild
+    if args.command == "iosbuild":
+        args.build_args = remaining
+    elif remaining:
+        parser.error(f"unrecognized arguments: {' '.join(remaining)}")
 
     args.func(args)
 
