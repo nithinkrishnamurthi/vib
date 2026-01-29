@@ -584,9 +584,8 @@ def get_default_branch(repo_path: str) -> str:
 def get_worktree_path(base_path: str, branch: str) -> str:
     """Calculate worktree path for a branch."""
     base_dir = os.path.dirname(base_path)
-    base_name = os.path.basename(base_path)
     sanitized = sanitize_branch_for_path(branch)
-    return os.path.join(base_dir, f"{base_name}--{sanitized}")
+    return os.path.join(base_dir, sanitized)
 
 
 def ensure_worktree(repo_path: str, branch: str, worktree_path: str) -> tuple:
@@ -594,23 +593,14 @@ def ensure_worktree(repo_path: str, branch: str, worktree_path: str) -> tuple:
     if os.path.isdir(worktree_path):
         return (True, f"Worktree already exists at {worktree_path}")
 
-    # Create the worktree
     result = subprocess.run(
-        ["git", "worktree", "add", worktree_path, branch],
+        ["git", "worktree", "add", worktree_path, f"origin/{branch}"],
         cwd=repo_path,
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
-        # Try creating with tracking branch
-        result = subprocess.run(
-            ["git", "worktree", "add", "-b", branch, worktree_path, f"origin/{branch}"],
-            cwd=repo_path,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            return (False, f"git worktree add failed: {result.stderr.strip()}")
+        return (False, f"git worktree add failed: {result.stderr.strip()}")
 
     return (True, f"Created worktree at {worktree_path}")
 
@@ -681,60 +671,21 @@ def handle_iosbuild_daemon(data: dict) -> dict:
         if result.returncode != 0:
             return {"status": "error", "message": f"git fetch failed: {result.stderr.strip()}"}
 
-        # Determine if we use main repo or a worktree
-        default_branch = get_default_branch(base_path)
-        using_worktree = branch != default_branch
+        # Always use a worktree for every branch
+        work_path = get_worktree_path(base_path, branch)
+        print(f"Using worktree at {work_path}...")
 
-        if using_worktree:
-            # Use worktree for non-default branches
-            work_path = get_worktree_path(base_path, branch)
-            print(f"Using worktree at {work_path}...")
+        # Ensure worktree exists
+        success, message = ensure_worktree(base_path, branch, work_path)
+        if not success:
+            return {"status": "error", "message": message}
+        print(message)
 
-            # Ensure worktree exists
-            success, message = ensure_worktree(base_path, branch, work_path)
-            if not success:
-                return {"status": "error", "message": message}
-            print(message)
-
-            # Update worktree to latest
-            success, message = update_worktree(work_path, branch)
-            if not success:
-                return {"status": "error", "message": message}
-            print(f"Reset to origin/{branch}")
-        else:
-            # Use main repo for default branch
-            work_path = base_path
-            print(f"Using main repo for default branch {branch}...")
-
-            # Checkout branch
-            print(f"Checking out branch {branch}...")
-            result = subprocess.run(
-                ["git", "checkout", branch],
-                cwd=work_path,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                # Try creating tracking branch
-                result = subprocess.run(
-                    ["git", "checkout", "-b", branch, f"origin/{branch}"],
-                    cwd=work_path,
-                    capture_output=True,
-                    text=True,
-                )
-                if result.returncode != 0:
-                    return {"status": "error", "message": f"git checkout failed: {result.stderr.strip()}"}
-
-            # Reset to match remote
-            print(f"Resetting to origin/{branch}...")
-            result = subprocess.run(
-                ["git", "reset", "--hard", f"origin/{branch}"],
-                cwd=work_path,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                return {"status": "error", "message": f"git reset failed: {result.stderr.strip()}"}
+        # Update worktree to latest
+        success, message = update_worktree(work_path, branch)
+        if not success:
+            return {"status": "error", "message": message}
+        print(f"Reset to origin/{branch}")
 
         # Open terminal with build command
         print(f"Opening terminal to run: {command}")
@@ -747,7 +698,6 @@ def handle_iosbuild_daemon(data: dict) -> dict:
             "branch": branch,
             "path": work_path,
             "command": command,
-            "worktree": using_worktree,
         }
 
     except Exception as e:
@@ -1042,8 +992,7 @@ def cmd_iosbuild(args):
         print(f"Error: {response.get('message')}", file=sys.stderr)
         sys.exit(1)
     else:
-        worktree_suffix = " (Using worktree)" if response.get("worktree") else ""
-        print(f"iOS build triggered successfully!{worktree_suffix}")
+        print(f"iOS build triggered successfully!")
         print(f"  Branch: {response.get('branch')}")
         print(f"  Path: {response.get('path')}")
         print(f"  Command: {response.get('command')}")
