@@ -43,6 +43,8 @@ if command -v idb &>/dev/null; then
     echo "  idb already installed: $(idb --version 2>&1 || echo 'unknown version')"
 else
     if command -v brew &>/dev/null; then
+        echo "  Tapping facebook/fb..."
+        brew tap facebook/fb
         echo "  Installing idb-companion via Homebrew..."
         brew install idb-companion
         echo "  Installing idb client via pip..."
