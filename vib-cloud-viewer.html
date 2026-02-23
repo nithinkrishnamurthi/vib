@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VIB Cloud — iOS Simulator</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #1a1a1a;
+    color: #fff;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    overflow: hidden;
+  }
+  #status-bar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 32px;
+    background: #111;
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    font-size: 12px;
+    color: #888;
+    z-index: 100;
+    gap: 16px;
+  }
+  #status-bar .session-id { color: #6cf; }
+  #status-bar .status { color: #6f6; }
+  #status-bar .status.disconnected { color: #f66; }
+  #sim-container {
+    position: relative;
+    max-height: calc(100vh - 32px);
+    margin-top: 32px;
+    cursor: default;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  #sim-stream {
+    max-height: calc(100vh - 32px);
+    max-width: 100vw;
+    display: block;
+  }
+  #input-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    cursor: default;
+  }
+</style>
+</head>
+<body>
+
+<div id="status-bar">
+  <span>VIB Cloud</span>
+  <span class="session-id" id="session-id">__SESSION_ID__</span>
+  <span class="status" id="stream-status">Connecting...</span>
+  <span style="flex:1"></span>
+  <span id="fps-counter">0 fps</span>
+</div>
+
+<div id="sim-container">
+  <img id="sim-stream" src="/sessions/__SESSION_ID__/stream" alt="iOS Simulator">
+  <canvas id="input-overlay"></canvas>
+</div>
+
+<script>
+(function() {
+  var SESSION_ID = '__SESSION_ID__';
+  var streamImg = document.getElementById('sim-stream');
+  var overlay = document.getElementById('input-overlay');
+  var statusEl = document.getElementById('stream-status');
+  var fpsEl = document.getElementById('fps-counter');
+
+  // --- Input via HTTP POST (same origin, no extra port/WebSocket) ---
+  function sendInput(event) {
+    fetch('/api/sessions/' + SESSION_ID + '/input', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(event),
+    }).catch(function() {});
+  }
+
+  // --- Stream health ---
+  var frameCount = 0;
+  var lastFpsUpdate = Date.now();
+
+  streamImg.onload = function() {
+    statusEl.textContent = 'Streaming';
+    statusEl.className = 'status';
+    frameCount++;
+    var now = Date.now();
+    if (now - lastFpsUpdate >= 1000) {
+      fpsEl.textContent = frameCount + ' fps';
+      frameCount = 0;
+      lastFpsUpdate = now;
+    }
+    overlay.width = streamImg.clientWidth;
+    overlay.height = streamImg.clientHeight;
+  };
+
+  streamImg.onerror = function() {
+    statusEl.textContent = 'Disconnected';
+    statusEl.className = 'status disconnected';
+    setTimeout(function() {
+      streamImg.src = '/sessions/' + SESSION_ID + '/stream?' + Date.now();
+    }, 2000);
+  };
+
+  // --- Mouse events ---
+  function getNormalizedCoords(e) {
+    var rect = overlay.getBoundingClientRect();
+    return {
+      x: (e.clientX - rect.left) / rect.width,
+      y: (e.clientY - rect.top) / rect.height,
+    };
+  }
+
+  var isMouseDown = false;
+
+  overlay.addEventListener('mousedown', function(e) {
+    e.preventDefault();
+    isMouseDown = true;
+    var c = getNormalizedCoords(e);
+    sendInput({type: 'mousedown', x: c.x, y: c.y, button: e.button});
+  });
+
+  overlay.addEventListener('mousemove', function(e) {
+    if (!isMouseDown) return;
+    e.preventDefault();
+    var c = getNormalizedCoords(e);
+    sendInput({type: 'mousemove', x: c.x, y: c.y});
+  });
+
+  overlay.addEventListener('mouseup', function(e) {
+    e.preventDefault();
+    isMouseDown = false;
+    var c = getNormalizedCoords(e);
+    sendInput({type: 'mouseup', x: c.x, y: c.y, button: e.button});
+  });
+
+  // Touch events
+  overlay.addEventListener('touchstart', function(e) {
+    e.preventDefault();
+    var c = getNormalizedCoords(e.touches[0]);
+    sendInput({type: 'mousedown', x: c.x, y: c.y, button: 0});
+  });
+
+  overlay.addEventListener('touchmove', function(e) {
+    e.preventDefault();
+    var c = getNormalizedCoords(e.touches[0]);
+    sendInput({type: 'mousemove', x: c.x, y: c.y});
+  });
+
+  overlay.addEventListener('touchend', function(e) {
+    e.preventDefault();
+    sendInput({type: 'mouseup', x: 0.5, y: 0.5, button: 0});
+  });
+
+  // Keyboard
+  document.addEventListener('keydown', function(e) {
+    sendInput({type: 'keydown', key: e.key, code: e.code, shift: e.shiftKey, meta: e.metaKey});
+  });
+
+  document.addEventListener('keyup', function(e) {
+    sendInput({type: 'keyup', key: e.key, code: e.code});
+  });
+
+  overlay.addEventListener('contextmenu', function(e) { e.preventDefault(); });
+})();
+</script>
+</body>
+</html>

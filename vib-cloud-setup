@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+#
+# vib-cloud-setup — One-time setup for VIB Cloud host machine
+#
+# Installs idb (iOS Development Bridge) for headless simulator management,
+# and sets up the vib-cloud-server daemon.
+#
+# Usage: bash vib-cloud-setup
+#
+
+set -euo pipefail
+
+echo "=== VIB Cloud Setup ==="
+echo ""
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+INSTALL_DIR="/usr/local/bin"
+SHARE_DIR="/usr/local/share/vib"
+
+# --- 1. Verify Xcode ---
+echo "[1/5] Checking Xcode installation..."
+if ! command -v xcodebuild &>/dev/null; then
+    echo "ERROR: Xcode not found. Install Xcode from the Mac App Store."
+    exit 1
+fi
+XCODE_VERSION=$(xcodebuild -version | head -1)
+echo "  Found: $XCODE_VERSION"
+
+# --- 2. Verify simulator runtimes ---
+echo "[2/5] Checking simulator runtimes..."
+RUNTIMES=$(xcrun simctl list runtimes 2>/dev/null | grep -c "iOS" || true)
+if [ "$RUNTIMES" -eq 0 ]; then
+    echo "WARNING: No iOS simulator runtimes found."
+    echo "  Install via: Xcode > Settings > Platforms > iOS Simulator"
+else
+    echo "  Found $RUNTIMES iOS runtime(s):"
+    xcrun simctl list runtimes | grep "iOS" | sed 's/^/    /'
+fi
+
+# --- 3. Install idb (iOS Development Bridge) ---
+echo "[3/5] Checking idb..."
+if command -v idb &>/dev/null; then
+    echo "  idb already installed: $(idb --version 2>&1 || echo 'unknown version')"
+else
+    if command -v brew &>/dev/null; then
+        echo "  Installing idb-companion via Homebrew..."
+        brew install idb-companion
+        echo "  Installing idb client via pip..."
+        pip3 install fb-idb
+    else
+        echo "ERROR: Homebrew not found. Install Homebrew first:"
+        echo '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+        echo "  Then re-run this setup."
+        exit 1
+    fi
+fi
+
+# Verify idb works
+if command -v idb &>/dev/null; then
+    echo "  Verifying idb..."
+    idb list-targets 2>/dev/null && echo "  idb OK" || echo "  WARNING: idb list-targets failed (may need idb_companion running)"
+fi
+
+# --- 4. Install vib-cloud-server + viewer ---
+echo "[4/5] Installing vib-cloud-server..."
+SERVER_SRC="$SCRIPT_DIR/vib-cloud-server"
+
+if [ ! -f "$SERVER_SRC" ]; then
+    echo "ERROR: vib-cloud-server not found at $SERVER_SRC"
+    exit 1
+fi
+
+if [ -w "$INSTALL_DIR" ]; then
+    cp "$SERVER_SRC" "$INSTALL_DIR/vib-cloud-server"
+    chmod +x "$INSTALL_DIR/vib-cloud-server"
+else
+    sudo cp "$SERVER_SRC" "$INSTALL_DIR/vib-cloud-server"
+    sudo chmod +x "$INSTALL_DIR/vib-cloud-server"
+fi
+echo "  Installed to $INSTALL_DIR/vib-cloud-server"
+
+# Install viewer HTML
+sudo mkdir -p "$SHARE_DIR"
+VIEWER_SRC="$SCRIPT_DIR/vib-cloud-viewer.html"
+if [ -f "$VIEWER_SRC" ]; then
+    sudo cp "$VIEWER_SRC" "$SHARE_DIR/vib-cloud-viewer.html"
+    echo "  Installed viewer to $SHARE_DIR/vib-cloud-viewer.html"
+fi
+
+# --- 5. Set up launchd service ---
+echo "[5/5] Setting up launchd service..."
+PLIST_DIR="$HOME/Library/LaunchAgents"
+PLIST_FILE="$PLIST_DIR/com.vib.cloud-server.plist"
+mkdir -p "$PLIST_DIR"
+
+cat > "$PLIST_FILE" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.vib.cloud-server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>python3</string>
+        <string>$INSTALL_DIR/vib-cloud-server</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/vib-cloud-server.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/vib-cloud-server.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
+PLIST
+
+echo "  Created $PLIST_FILE"
+
+launchctl unload "$PLIST_FILE" 2>/dev/null || true
+launchctl load "$PLIST_FILE"
+echo "  Service loaded"
+
+# Create sessions directory
+mkdir -p "$HOME/vib-sessions"
+
+echo ""
+echo "=== Setup Complete ==="
+echo ""
+echo "Service management:"
+echo "  launchctl list | grep vib             # Check if running"
+echo "  launchctl stop com.vib.cloud-server   # Stop"
+echo "  launchctl start com.vib.cloud-server  # Start"
+echo "  tail -f /tmp/vib-cloud-server.log     # View logs"
+echo ""
+echo "Test: curl http://127.0.0.1:8500/api/ping"

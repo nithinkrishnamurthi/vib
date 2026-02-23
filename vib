@@ -109,6 +109,22 @@ def get_iosbuild_config() -> dict:
     }
 
 
+def get_cloud_config() -> dict:
+    """Get cloud configuration from ~/.vib/config.
+
+    Returns:
+        dict with cloud config values
+    """
+    return {
+        "host": get_config_value("cloud_host"),
+        "project_dir": get_config_value("cloud_project_dir", "~/vib-sessions"),
+        "device": get_config_value("cloud_sim_device", "iPhone 16 Pro"),
+        "runtime": get_config_value("cloud_sim_runtime"),
+        "build_command": get_config_value("cloud_build_command",
+                                          "xcodebuild -scheme MyApp -sdk iphonesimulator build"),
+    }
+
+
 def resolve_hostname_to_ips(hostname: str) -> list:
     """Resolve a hostname to its IP addresses."""
     try:
@@ -594,7 +610,7 @@ def ensure_worktree(repo_path: str, branch: str, worktree_path: str) -> tuple:
         return (True, f"Worktree already exists at {worktree_path}")
 
     result = subprocess.run(
-        ["git", "worktree", "add", worktree_path, f"origin/{branch}"],
+        ["git", "worktree", "add", "-B", branch, worktree_path, f"origin/{branch}"],
         cwd=repo_path,
         capture_output=True,
         text=True,
@@ -998,6 +1014,415 @@ def cmd_iosbuild(args):
         print(f"  Command: {response.get('command')}")
 
 
+def cloud_zip_project():
+    """Zip the current project directory.
+
+    Uses `git archive` if in a git repo (respects .gitignore automatically),
+    otherwise falls back to zipfile with manual exclusions.
+
+    Returns:
+        bytes (zip data)
+    """
+    import io
+    import zipfile
+
+    cwd = os.getcwd()
+
+    # Try git archive first — cleanest, respects .gitignore
+    try:
+        result = subprocess.run(
+            ["git", "archive", "--format=zip", "HEAD"],
+            capture_output=True, cwd=cwd, timeout=60,
+        )
+        if result.returncode == 0 and result.stdout:
+            return result.stdout
+    except Exception:
+        pass
+
+    # Fallback: build zip manually
+    zip_buf = io.BytesIO()
+    exclude = {".git", "__pycache__", ".DS_Store", "node_modules", ".venv", "venv"}
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, files in os.walk(cwd):
+            dirs[:] = [d for d in dirs if d not in exclude]
+            for f in files:
+                if f.endswith(".pyc"):
+                    continue
+                full = os.path.join(root, f)
+                arc = os.path.relpath(full, cwd)
+                zf.write(full, arc)
+    return zip_buf.getvalue()
+
+
+CLOUD_SERVER_PORT = 8500
+
+
+def cloud_base_url(host):
+    """Return the base URL for the cloud server."""
+    return f"http://{host}:{CLOUD_SERVER_PORT}"
+
+
+def cloud_upload_to_session(host, session_id, zip_data):
+    """Upload a zip file to a specific session on the cloud server.
+
+    Returns:
+        (success, message) tuple
+    """
+    import urllib.request
+    import urllib.error
+
+    size_mb = len(zip_data) / (1024 * 1024)
+    url = f"{cloud_base_url(host)}/api/sessions/{session_id}/upload"
+    req = urllib.request.Request(
+        url, data=zip_data, method="POST",
+        headers={"Content-Type": "application/zip"},
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read())
+            if result.get("status") == "ok":
+                return (True, f"Uploaded {size_mb:.1f} MB → {result.get('project_dir', '?')}")
+            return (False, result.get("message", "Upload failed"))
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read())
+            return (False, body.get("message", f"HTTP {e.code}"))
+        except Exception:
+            return (False, f"HTTP {e.code}: {e.reason}")
+    except urllib.error.URLError as e:
+        return (False, f"Connection failed: {e.reason}")
+    except Exception as e:
+        return (False, str(e))
+
+
+def cloud_api_request(host, method, path, data=None, timeout=30):
+    """Send an HTTP request to the vib-cloud-server.
+
+    Args:
+        host: Cloud server hostname/IP
+        method: HTTP method (GET, POST, DELETE)
+        path: API path (e.g., "/api/sessions")
+        data: JSON body for POST requests (dict)
+        timeout: Request timeout in seconds
+
+    Returns:
+        Response dict from the server
+    """
+    import urllib.request
+    import urllib.error
+
+    url = f"{cloud_base_url(host)}{path}"
+
+    body = json.dumps(data).encode() if data else None
+    req = urllib.request.Request(
+        url, data=body, method=method,
+        headers={"Content-Type": "application/json"} if body else {},
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read())
+        except Exception:
+            return {"status": "error", "message": f"HTTP {e.code}: {e.reason}"}
+    except urllib.error.URLError as e:
+        return {"status": "error", "message": f"Connection failed: {e.reason}"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+def cmd_cloud(args):
+    """Handle 'vib cloud' command — dispatcher."""
+    sub = getattr(args, "cloud_command", None)
+
+    # Setup doesn't need a host — it just prints instructions
+    if sub == "setup":
+        cmd_cloud_setup(args)
+        return
+
+    config = get_cloud_config()
+    host = args.host if hasattr(args, "host") and args.host else config["host"]
+
+    if not host:
+        print("Error: No cloud host specified.", file=sys.stderr)
+        print("Set 'cloud_host = yourhost' in ~/.vib/config or use --host", file=sys.stderr)
+        sys.exit(1)
+
+    args._cloud_config = config
+    args._cloud_host = host
+
+    if sub == "push":
+        cmd_cloud_push(args)
+    elif sub == "build":
+        cmd_cloud_build(args)
+    elif sub == "sim":
+        cmd_cloud_sim(args)
+    elif sub == "list":
+        cmd_cloud_list(args)
+    elif sub == "kill":
+        cmd_cloud_kill(args)
+    else:
+        cmd_cloud_full(args)
+
+
+def cmd_cloud_push(args):
+    """Handle 'vib cloud push' — create session + upload project files."""
+    host = args._cloud_host
+    config = args._cloud_config
+    project = os.path.basename(os.getcwd())
+    branch = args.branch if hasattr(args, "branch") and args.branch else (get_git_branch() or "main")
+    device = args.device if hasattr(args, "device") and args.device else config["device"]
+
+    print("Creating session...")
+    response = cloud_api_request(host, "POST", "/api/sessions", {
+        "project": project,
+        "branch": branch,
+        "device": device,
+        "build_command": config.get("build_command"),
+    })
+    if response.get("status") != "ok":
+        print(f"Error: {response.get('message', 'Failed to create session')}", file=sys.stderr)
+        sys.exit(1)
+
+    session_id = response["session"]["id"]
+    print(f"Session {session_id} created")
+
+    print("Zipping and uploading project...")
+    zip_data = cloud_zip_project()
+    success, message = cloud_upload_to_session(host, session_id, zip_data)
+    if not success:
+        print(f"Error: {message}", file=sys.stderr)
+        sys.exit(1)
+    print(message)
+
+
+def cmd_cloud_build(args):
+    """Handle 'vib cloud build' — trigger build on remote."""
+    host = args._cloud_host
+    config = args._cloud_config
+
+    response = cloud_api_request(host, "GET", "/api/sessions")
+    if response.get("status") != "ok":
+        print(f"Error: {response.get('message', 'Failed to list sessions')}", file=sys.stderr)
+        sys.exit(1)
+
+    sess = response.get("sessions", [])
+    if not sess:
+        print("No active sessions. Run 'vib cloud' first to create one.", file=sys.stderr)
+        sys.exit(1)
+
+    session_id = sess[0]["id"]
+    build_cmd = config.get("build_command")
+
+    print(f"Building in session {session_id}...")
+    response = cloud_api_request(host, "POST", f"/api/sessions/{session_id}/build", {
+        "command": build_cmd,
+    }, timeout=600)
+
+    if response.get("build_success"):
+        print("Build succeeded!")
+    else:
+        print(f"Build failed: {response.get('message', '')}", file=sys.stderr)
+        output = response.get("output", "")
+        if output:
+            print(output)
+        sys.exit(1)
+
+
+def cmd_cloud_sim(args):
+    """Handle 'vib cloud sim' — create session + stream."""
+    host = args._cloud_host
+    config = args._cloud_config
+
+    project = os.path.basename(os.getcwd())
+    branch = args.branch if hasattr(args, "branch") and args.branch else (get_git_branch() or "main")
+    device = args.device if hasattr(args, "device") and args.device else config["device"]
+
+    print(f"Creating simulator session ({device})...")
+    response = cloud_api_request(host, "POST", "/api/sessions", {
+        "project": project,
+        "branch": branch,
+        "device": device,
+        "build_command": config.get("build_command"),
+        "runtime": config.get("runtime"),
+    }, timeout=60)
+
+    if response.get("status") != "ok":
+        print(f"Error: {response.get('message', 'Failed to create session')}", file=sys.stderr)
+        sys.exit(1)
+
+    session = response["session"]
+    print(f"Session created: {session['id']}")
+    print(f"  Simulator: {session['sim_device']} ({session['sim_udid']})")
+
+    _run_cloud_viewer(host, session)
+
+
+def cmd_cloud_list(args):
+    """Handle 'vib cloud list' — list active sessions."""
+    host = args._cloud_host
+    response = cloud_api_request(host, "GET", "/api/sessions")
+    if response.get("status") != "ok":
+        print(f"Error: {response.get('message', 'Failed to list sessions')}", file=sys.stderr)
+        sys.exit(1)
+
+    sess = response.get("sessions", [])
+    if not sess:
+        print("No active sessions.")
+        return
+
+    print(f"{'ID':<12} {'Device':<20} {'Branch':<20} {'Status':<12}")
+    print("-" * 64)
+    for s in sess:
+        print(f"{s['id']:<12} {s.get('sim_device','?'):<20} {s.get('branch','?'):<20} "
+              f"{s.get('status','?'):<12}")
+
+
+def cmd_cloud_kill(args):
+    """Handle 'vib cloud kill' — destroy sessions."""
+    host = args._cloud_host
+    if hasattr(args, "all") and args.all:
+        print("Destroying all sessions...")
+        response = cloud_api_request(host, "DELETE", "/api/sessions")
+        if response.get("status") != "ok":
+            print(f"Error: {response.get('message')}", file=sys.stderr)
+            sys.exit(1)
+        destroyed = response.get("destroyed", [])
+        print(f"Destroyed {len(destroyed)} session(s)")
+    else:
+        session_id = args.session_id if hasattr(args, "session_id") else None
+        if not session_id:
+            print("Error: Specify a session ID or use --all", file=sys.stderr)
+            sys.exit(1)
+        print(f"Destroying session {session_id}...")
+        response = cloud_api_request(host, "DELETE", f"/api/sessions/{session_id}")
+        if response.get("status") != "ok":
+            print(f"Error: {response.get('message')}", file=sys.stderr)
+            sys.exit(1)
+        print("Session destroyed")
+
+
+def cmd_cloud_setup(args):
+    """Handle 'vib cloud setup' — prints instructions for server setup."""
+    print("VIB Cloud Setup")
+    print("===============")
+    print("")
+    print("On your Mac host machine, clone the repo and run:")
+    print("")
+    print("  bash vib-cloud-setup")
+    print("")
+    print("This installs idb, the vib-cloud-server daemon, and starts it on port 8500.")
+    print("")
+    print("Then on your client, set the host:")
+    print("")
+    print("  echo 'cloud_host = <your-mac-ip>' >> ~/.vib/config")
+
+
+def cmd_cloud_full(args):
+    """Handle 'vib cloud' (no subcommand) — full pipeline."""
+    host = args._cloud_host
+    config = args._cloud_config
+
+    project = os.path.basename(os.getcwd())
+    branch = args.branch if hasattr(args, "branch") and args.branch else (get_git_branch() or "main")
+    device = args.device if hasattr(args, "device") and args.device else config["device"]
+    no_push = hasattr(args, "no_push") and args.no_push
+    no_build = hasattr(args, "no_build") and args.no_build
+
+    # Step 1: Create session (boots simulator headlessly)
+    print(f"[1/4] Creating simulator session ({device})...")
+    response = cloud_api_request(host, "POST", "/api/sessions", {
+        "project": project,
+        "branch": branch,
+        "device": device,
+        "build_command": config.get("build_command"),
+        "runtime": config.get("runtime"),
+    }, timeout=60)
+
+    if response.get("status") != "ok":
+        print(f"Error: {response.get('message', 'Failed to create session')}", file=sys.stderr)
+        sys.exit(1)
+
+    session = response["session"]
+    session_id = session["id"]
+    print(f"  Session: {session_id}")
+    print(f"  Simulator: {session['sim_device']} ({session['sim_udid']})")
+
+    # Step 2: Upload project files to the session
+    if not no_push:
+        print(f"[2/4] Uploading project...")
+        zip_data = cloud_zip_project()
+        success, message = cloud_upload_to_session(host, session_id, zip_data)
+        if not success:
+            print(f"Error: {message}", file=sys.stderr)
+            sys.exit(1)
+        print(f"  {message}")
+    else:
+        print("[2/4] Skipping upload (--no-push)")
+
+    # Step 3: Build
+    if not no_build:
+        print(f"[3/4] Building...")
+        build_response = cloud_api_request(host, "POST", f"/api/sessions/{session_id}/build", {
+            "command": config.get("build_command"),
+        }, timeout=600)
+
+        if build_response.get("build_success"):
+            print("  Build succeeded!")
+        else:
+            print(f"  Build failed: {build_response.get('message', '')}", file=sys.stderr)
+            output = build_response.get("output", "")
+            if output:
+                lines = output.strip().split("\n")
+                for line in lines[-50:]:
+                    print(f"  {line}")
+            print("  Continuing to stream simulator despite build failure...")
+    else:
+        print("[3/4] Skipping build (--no-build)")
+
+    # Step 4: Open browser
+    print(f"[4/4] Opening browser...")
+    _run_cloud_viewer(host, session)
+
+
+def _run_cloud_viewer(host, session):
+    """Open the browser viewer and block until Ctrl+C."""
+    session_id = session["id"]
+
+    url = f"{cloud_base_url(host)}/sessions/{session_id}/"
+
+    import webbrowser
+    try:
+        webbrowser.open(url)
+        print(f"  Opened: {url}")
+    except Exception:
+        print(f"  Open in browser: {url}")
+
+    print(f"\nSession {session_id} is live. Press Ctrl+C to stop.")
+
+    stop_event = threading.Event()
+
+    def handle_signal(signum, frame):
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    try:
+        while not stop_event.is_set():
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print("\nCleaning up...")
+        print(f"Destroying session {session_id}...")
+        cloud_api_request(host, "DELETE", f"/api/sessions/{session_id}")
+        print("Done.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="VIB - Remote Development Bridge Tool",
@@ -1022,12 +1447,27 @@ Examples:
     vib iosbuild --no-push  Trigger build without pushing (already pushed)
     vib iosbuild --clean    Pass --clean flag to the build script
 
+  Cloud (run locally, targets AWS Mac):
+    vib cloud               Full pipeline: push, build, boot sim, stream
+    vib cloud push           Sync files only
+    vib cloud build          Build on remote
+    vib cloud sim            Boot sim + stream only
+    vib cloud list           List active sessions
+    vib cloud kill <id>      Destroy a session
+    vib cloud kill --all     Destroy all sessions
+    vib cloud setup          Show server setup instructions
+
   Config file (~/.vib/config):
     host = anton            Default SSH host for tunnel
     iosbuild_path = /Users/nithin/Projects/MyiOSApp
                             Path to iOS repo on client (required for iosbuild)
     iosbuild_command = ./scripts/local-ios-build.sh
                             Build command to run (default: ./scripts/local-ios-build.sh)
+    cloud_host = awsmac     SSH host alias for AWS Mac
+    cloud_sim_device = iPhone 16 Pro
+                            Default simulator device for cloud
+    cloud_build_command = xcodebuild -scheme MyApp -sdk iphonesimulator build
+                            Build command for cloud sessions
 
   Service management:
     systemctl --user status vib     Check service status
@@ -1056,6 +1496,7 @@ Examples:
 
     # openpr command
     openpr_parser = subparsers.add_parser("openpr", help="Open GitHub PR creation page")
+    openpr_parser.add_argument("--create", action="store_true", help="Create the PR via gh CLI instead of opening the browser")
     openpr_parser.set_defaults(func=cmd_openpr)
 
     # curs command
@@ -1071,6 +1512,70 @@ Examples:
         help="Don't push changes before triggering build"
     )
     iosbuild_parser.set_defaults(func=cmd_iosbuild)
+
+    # cloud command
+    cloud_parser = subparsers.add_parser(
+        "cloud",
+        help="Remote iOS simulator on AWS Mac",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Subcommands:
+  (none)      Full pipeline: push → build → sim → stream
+  push        Sync project files to remote
+  build       Run build on remote
+  sim         Boot simulator and stream
+  list        List active sessions
+  kill        Destroy a session
+  setup       Show server setup instructions
+
+Examples:
+  vib cloud                         Full pipeline
+  vib cloud push                    Sync files only
+  vib cloud build                   Build only
+  vib cloud sim                     Boot sim + stream
+  vib cloud list                    List active sessions
+  vib cloud kill abc123             Destroy specific session
+  vib cloud kill --all              Destroy all sessions
+  vib cloud setup                   Show server setup instructions
+  vib cloud --host myhost           Use specific host
+  vib cloud --device "iPhone 15"    Use specific device
+  vib cloud --no-push --no-build    Sim only, skip sync and build
+
+Config (~/.vib/config):
+  cloud_host = awsmac
+  cloud_sim_device = iPhone 16 Pro
+  cloud_sim_runtime = iOS-18-2
+  cloud_build_command = xcodebuild -scheme MyApp -sdk iphonesimulator build
+        """,
+    )
+    cloud_parser.add_argument("--host", help="SSH host alias for the AWS Mac")
+    cloud_parser.add_argument("--device", help="Simulator device (e.g., 'iPhone 16 Pro')")
+    cloud_parser.add_argument("--branch", help="Branch name (default: current git branch)")
+    cloud_parser.add_argument("--no-push", action="store_true", help="Skip file sync")
+    cloud_parser.add_argument("--no-build", action="store_true", help="Skip build step")
+    cloud_parser.set_defaults(func=cmd_cloud, cloud_command=None)
+
+    cloud_sub = cloud_parser.add_subparsers(dest="cloud_command")
+
+    cloud_push = cloud_sub.add_parser("push", help="Sync project files to remote")
+    cloud_push.set_defaults(func=cmd_cloud)
+
+    cloud_build = cloud_sub.add_parser("build", help="Run build on remote")
+    cloud_build.set_defaults(func=cmd_cloud)
+
+    cloud_sim = cloud_sub.add_parser("sim", help="Boot simulator and stream")
+    cloud_sim.set_defaults(func=cmd_cloud)
+
+    cloud_list = cloud_sub.add_parser("list", help="List active sessions")
+    cloud_list.set_defaults(func=cmd_cloud)
+
+    cloud_kill = cloud_sub.add_parser("kill", help="Destroy a session")
+    cloud_kill.add_argument("session_id", nargs="?", help="Session ID to destroy")
+    cloud_kill.add_argument("--all", action="store_true", help="Destroy all sessions")
+    cloud_kill.set_defaults(func=cmd_cloud)
+
+    cloud_setup = cloud_sub.add_parser("setup", help="Show server setup instructions")
+    cloud_setup.set_defaults(func=cmd_cloud)
 
     args, remaining = parser.parse_known_args()
 

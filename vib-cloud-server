@@ -1,0 +1,863 @@
+#!/usr/bin/env python3
+"""
+VIB Cloud Server — Session manager for remote iOS simulators on AWS Mac.
+
+Runs as a daemon on the AWS Mac instance. Single HTTP server on port 8500
+handles everything: API, MJPEG streaming, input forwarding, viewer.
+
+Uses idb (iOS Development Bridge) for headless simulator management:
+  - idb video-stream --format mjpeg  → MJPEG capture (no GUI needed)
+  - idb Python client (gRPC)         → persistent connection for low-latency input
+  - simctl install / launch          → app lifecycle
+
+All client communication is direct HTTP on port 8500.
+"""
+
+import asyncio
+import hashlib
+import http.server
+import io
+import json
+import logging
+import os
+import re
+import signal
+import shutil
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import zipfile
+from pathlib import Path
+from urllib.parse import urlparse
+
+from idb.grpc.client import Client as IdbClient
+from idb.common.types import Address
+
+
+# Config
+VIB_SESSIONS_DIR = Path.home() / "vib-sessions"
+SERVER_PORT = 8500
+
+# Global session store
+sessions = {}
+sessions_lock = threading.Lock()
+
+
+class Session:
+    """Represents a single simulator session."""
+
+    def __init__(self, session_id, project, branch, device, build_command):
+        self.id = session_id
+        self.project = project
+        self.branch = branch
+        self.device = device
+        self.build_command = build_command
+        self.sim_udid = None
+        self.sim_device = device
+        self.status = "creating"
+        self.project_dir = VIB_SESSIONS_DIR / session_id / "project"
+        self.capture_process = None
+        self.latest_frame = None
+        self.frame_lock = threading.Lock()
+        self.idb_client = None
+        self._idb_loop = None
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "project": self.project,
+            "branch": self.branch,
+            "sim_udid": self.sim_udid,
+            "sim_device": self.sim_device,
+            "status": self.status,
+            "project_dir": str(self.project_dir),
+        }
+
+    def save_metadata(self):
+        meta_dir = VIB_SESSIONS_DIR / self.id
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        (meta_dir / "session.json").write_text(json.dumps(self.to_dict(), indent=2))
+
+
+def generate_session_id(project, branch):
+    raw = f"{project}-{branch}-{time.time()}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:8]
+
+
+# --- Simulator Management (via simctl, booted headlessly) ---
+
+def create_simulator(session_id, device, runtime=None):
+    """Create a simulator device with a unique name. Returns (udid, name)."""
+    result = subprocess.run(
+        ["xcrun", "simctl", "list", "devicetypes", "-j"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to list device types: {result.stderr}")
+
+    device_types = json.loads(result.stdout).get("devicetypes", [])
+    device_id = None
+    for dt in device_types:
+        if device.lower() in dt["name"].lower():
+            device_id = dt["identifier"]
+            break
+    if not device_id:
+        raise RuntimeError(f"Device type not found: {device}")
+
+    if not runtime:
+        result = subprocess.run(
+            ["xcrun", "simctl", "list", "runtimes", "-j"],
+            capture_output=True, text=True,
+        )
+        runtimes = json.loads(result.stdout).get("runtimes", [])
+        ios_runtimes = [r for r in runtimes if "iOS" in r.get("name", "") and r.get("isAvailable")]
+        if not ios_runtimes:
+            raise RuntimeError("No available iOS runtimes found")
+        runtime_id = ios_runtimes[-1]["identifier"]
+    else:
+        runtime_id = f"com.apple.CoreSimulator.SimRuntime.{runtime}"
+
+    # Unique name per session so window lookups never collide
+    sim_name = f"vib-{session_id}"
+    result = subprocess.run(
+        ["xcrun", "simctl", "create", sim_name, device_id, runtime_id],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to create simulator: {result.stderr}")
+
+    return result.stdout.strip(), sim_name
+
+
+def boot_simulator(udid):
+    result = subprocess.run(["xcrun", "simctl", "boot", udid], capture_output=True, text=True)
+    if result.returncode != 0 and "already booted" not in result.stderr.lower():
+        raise RuntimeError(f"Failed to boot simulator: {result.stderr}")
+
+
+def shutdown_simulator(udid):
+    subprocess.run(["xcrun", "simctl", "shutdown", udid], capture_output=True, text=True)
+
+
+def delete_simulator(udid):
+    subprocess.run(["xcrun", "simctl", "delete", udid], capture_output=True, text=True)
+
+
+# --- Build ---
+
+def run_build(session, command=None):
+    """Build, install, and launch the app on the session's simulator."""
+    cmd = command or session.build_command
+    if not cmd:
+        return False, "No build command specified"
+
+    derived_data = session.project_dir / "DerivedData"
+
+    # Inject -derivedDataPath so we know where the .app ends up
+    build_cmd = f"{cmd} -derivedDataPath {derived_data}"
+
+    print(f"[{session.id}] Building: {build_cmd}")
+    try:
+        result = subprocess.run(
+            build_cmd, shell=True, cwd=str(session.project_dir),
+            capture_output=True, text=True, timeout=600,
+        )
+        output = result.stdout + result.stderr
+        if result.returncode != 0:
+            print(f"[{session.id}] Build failed (exit {result.returncode})")
+            return False, output
+        print(f"[{session.id}] Build succeeded")
+    except subprocess.TimeoutExpired:
+        return False, "Build timed out (10 minutes)"
+    except Exception as e:
+        return False, str(e)
+
+    # Find the .app bundle in build products
+    app_path = _find_app_bundle(derived_data)
+    if not app_path:
+        return False, output + "\n\nBuild succeeded but no .app bundle found in DerivedData"
+
+    # Install onto the simulator
+    print(f"[{session.id}] Installing {app_path.name}...")
+    install_result = subprocess.run(
+        ["xcrun", "simctl", "install", session.sim_udid, str(app_path)],
+        capture_output=True, text=True, timeout=60,
+    )
+    if install_result.returncode != 0:
+        return False, output + f"\n\nInstall failed: {install_result.stderr}"
+
+    # Extract bundle ID and launch
+    bundle_id = _get_bundle_id(app_path)
+    if not bundle_id:
+        return False, output + f"\n\nInstalled but could not determine bundle ID from {app_path.name}"
+
+    print(f"[{session.id}] Launching {bundle_id}...")
+    launch_result = subprocess.run(
+        ["xcrun", "simctl", "launch", session.sim_udid, bundle_id],
+        capture_output=True, text=True, timeout=30,
+    )
+    if launch_result.returncode != 0:
+        return False, output + f"\n\nLaunch failed: {launch_result.stderr}"
+
+    print(f"[{session.id}] App running: {bundle_id}")
+    return True, output
+
+
+def _find_app_bundle(derived_data):
+    """Find the .app bundle in DerivedData build products."""
+    products_dir = derived_data / "Build" / "Products"
+    if not products_dir.exists():
+        return None
+
+    # Look in *-iphonesimulator directories first, fall back to any directory
+    for pattern in ["*-iphonesimulator/*.app", "*/*.app"]:
+        apps = list(products_dir.glob(pattern))
+        if apps:
+            return apps[0]
+    return None
+
+
+def _get_bundle_id(app_path):
+    """Extract CFBundleIdentifier from an .app's Info.plist."""
+    plist_path = app_path / "Info.plist"
+    if not plist_path.exists():
+        return None
+
+    try:
+        result = subprocess.run(
+            ["/usr/libexec/PlistBuddy", "-c", "Print :CFBundleIdentifier", str(plist_path)],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+# --- Screen Capture via idb ---
+
+def start_capture(session, fps=30, quality=0.7):
+    """Start idb video-stream for the session's simulator.
+
+    idb outputs a continuous MJPEG stream to stdout — one JPEG after another,
+    each prefixed with a Content-Length-style header or just raw JPEG frames
+    delimited by JPEG SOI/EOI markers.
+    """
+    if not session.sim_udid:
+        print(f"[{session.id}] No sim UDID, cannot start capture")
+        return False
+
+    try:
+        session.capture_process = subprocess.Popen(
+            [
+                "idb", "video-stream",
+                "--udid", session.sim_udid,
+                "--format", "mjpeg",
+                "--fps", str(fps),
+                "--compression-quality", str(quality),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        threading.Thread(
+            target=_read_mjpeg_stream, args=(session,), daemon=True,
+        ).start()
+        print(f"[{session.id}] idb video-stream started ({fps} fps)")
+        return True
+    except FileNotFoundError:
+        print(f"[{session.id}] idb not found — is idb-companion installed?")
+        return False
+    except Exception as e:
+        print(f"[{session.id}] Failed to start capture: {e}")
+        return False
+
+
+def _read_mjpeg_stream(session):
+    """Read JPEG frames from idb video-stream stdout.
+
+    idb mjpeg format outputs raw concatenated JPEG images.
+    We split on JPEG SOI (FF D8) / EOI (FF D9) markers.
+    """
+    JPEG_SOI = b"\xff\xd8"
+    JPEG_EOI = b"\xff\xd9"
+
+    buf = b""
+    stdout = session.capture_process.stdout
+
+    try:
+        while session.capture_process and session.capture_process.poll() is None:
+            chunk = stdout.read(65536)
+            if not chunk:
+                break
+            buf += chunk
+
+            # Extract complete JPEG frames from the buffer
+            while True:
+                soi = buf.find(JPEG_SOI)
+                if soi == -1:
+                    buf = b""
+                    break
+
+                eoi = buf.find(JPEG_EOI, soi + 2)
+                if eoi == -1:
+                    # Incomplete frame — keep from SOI onward
+                    buf = buf[soi:]
+                    break
+
+                # Complete frame: SOI through EOI (inclusive of 2-byte EOI marker)
+                frame = buf[soi:eoi + 2]
+                buf = buf[eoi + 2:]
+
+                with session.frame_lock:
+                    session.latest_frame = frame
+    except Exception as e:
+        print(f"[{session.id}] Frame reader error: {e}")
+
+
+def stop_capture(session):
+    if session.capture_process and session.capture_process.poll() is None:
+        session.capture_process.terminate()
+        try:
+            session.capture_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            session.capture_process.kill()
+        session.capture_process = None
+
+
+# --- Input Injection via idb Python client (persistent gRPC connection) ---
+
+# Shared event loop for all idb async calls, runs in a background thread
+_idb_loop = None
+_idb_loop_lock = threading.Lock()
+
+
+def _get_idb_loop():
+    """Get or create the shared asyncio event loop for idb calls."""
+    global _idb_loop
+    with _idb_loop_lock:
+        if _idb_loop is None or _idb_loop.is_closed():
+            _idb_loop = asyncio.new_event_loop()
+            t = threading.Thread(target=_idb_loop.run_forever, daemon=True)
+            t.start()
+        return _idb_loop
+
+
+async def _connect_idb_client(udid):
+    """Create a persistent idb client connected to a specific companion."""
+    logger = logging.getLogger("idb")
+    # idb_companion listens on a domain socket by default,
+    # but also on a TCP port. The default companion port is 10882.
+    companion_address = Address(host="localhost", port=10882)
+    client = await IdbClient.build(
+        address=companion_address,
+        logger=logger,
+    ).__aenter__()
+    return client
+
+
+def connect_idb_client(session):
+    """Set up a persistent idb client for a session."""
+    loop = _get_idb_loop()
+    future = asyncio.run_coroutine_threadsafe(
+        _connect_idb_client(session.sim_udid), loop
+    )
+    try:
+        session.idb_client = future.result(timeout=10)
+        session._idb_loop = loop
+        print(f"[{session.id}] idb client connected (persistent gRPC)")
+    except Exception as e:
+        print(f"[{session.id}] Failed to connect idb client: {e}")
+        print(f"[{session.id}] Falling back to CLI for input injection")
+
+
+def disconnect_idb_client(session):
+    """Clean up the persistent idb client."""
+    if session.idb_client and session._idb_loop:
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                session.idb_client.__aexit__(None, None, None),
+                session._idb_loop,
+            )
+            future.result(timeout=5)
+        except Exception:
+            pass
+        session.idb_client = None
+
+
+def inject_input(session, event):
+    """Inject touch/tap events into the simulator via idb.
+
+    Uses the persistent Python gRPC client if available, falls back to CLI.
+    Event format from browser: {"type": "mousedown"|"mouseup"|"click", "x": 0-1, "y": 0-1}
+    Coordinates are normalized 0-1, converted to logical screen points.
+    """
+    if not session.sim_udid:
+        return
+
+    event_type = event.get("type", "")
+    nx = event.get("x", 0.5)
+    ny = event.get("y", 0.5)
+
+    # Logical screen points (iPhone default)
+    # TODO: query actual resolution from idb describe
+    screen_w, screen_h = 393, 852
+    px = int(nx * screen_w)
+    py = int(ny * screen_h)
+
+    if session.idb_client and session._idb_loop:
+        _inject_via_client(session, event_type, px, py, event)
+    else:
+        _inject_via_cli(session, event_type, px, py, event)
+
+
+def _inject_via_client(session, event_type, px, py, event):
+    """Inject input via persistent gRPC client (~5-10ms per call)."""
+    loop = session._idb_loop
+    client = session.idb_client
+
+    try:
+        if event_type in ("click", "mousedown"):
+            future = asyncio.run_coroutine_threadsafe(
+                client.tap(float(px), float(py)), loop
+            )
+            future.result(timeout=5)
+        elif event_type == "keydown":
+            key = event.get("key", "")
+            if len(key) == 1:
+                future = asyncio.run_coroutine_threadsafe(
+                    client.text(key), loop
+                )
+                future.result(timeout=5)
+    except Exception as e:
+        print(f"[{session.id}] idb client input error: {e}")
+
+
+def _inject_via_cli(session, event_type, px, py, event):
+    """Fallback: inject input via idb CLI (~50-100ms per call)."""
+    if event_type in ("click", "mousedown"):
+        subprocess.run(
+            ["idb", "ui", "tap", "--udid", session.sim_udid, str(px), str(py)],
+            capture_output=True, timeout=5,
+        )
+    elif event_type == "keydown":
+        key = event.get("key", "")
+        if len(key) == 1:
+            subprocess.run(
+                ["idb", "ui", "text", "--udid", session.sim_udid, key],
+                capture_output=True, timeout=5,
+            )
+
+
+# --- Session Lifecycle ---
+
+def create_session(project, branch, device, build_command, runtime=None):
+    session_id = generate_session_id(project, branch)
+    session = Session(session_id, project, branch, device, build_command)
+    session.project_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"[{session_id}] Creating session: {project} ({branch}) on {device}")
+
+    try:
+        session.sim_udid, _ = create_simulator(session_id, device, runtime)
+        print(f"[{session_id}] Simulator created: {session.sim_udid}")
+
+        boot_simulator(session.sim_udid)
+        print(f"[{session_id}] Simulator booted (headless)")
+
+        # Give the simulator a moment to finish booting
+        time.sleep(2)
+
+        session.status = "running"
+        start_capture(session)
+        connect_idb_client(session)
+
+        with sessions_lock:
+            sessions[session_id] = session
+        session.save_metadata()
+
+        return session
+
+    except Exception as e:
+        print(f"[{session_id}] Session creation failed: {e}")
+        if session.sim_udid:
+            shutdown_simulator(session.sim_udid)
+            delete_simulator(session.sim_udid)
+        session.status = "failed"
+        raise
+
+
+def destroy_session(session_id):
+    with sessions_lock:
+        session = sessions.get(session_id)
+        if not session:
+            return False, f"Session not found: {session_id}"
+
+    print(f"[{session_id}] Destroying session...")
+    session.status = "destroying"
+
+    disconnect_idb_client(session)
+    stop_capture(session)
+
+    if session.sim_udid:
+        shutdown_simulator(session.sim_udid)
+        delete_simulator(session.sim_udid)
+
+    session_dir = VIB_SESSIONS_DIR / session_id
+    if session_dir.exists():
+        shutil.rmtree(session_dir, ignore_errors=True)
+
+    with sessions_lock:
+        sessions.pop(session_id, None)
+
+    print(f"[{session_id}] Session destroyed")
+    return True, "Session destroyed"
+
+
+def list_sessions():
+    with sessions_lock:
+        return [s.to_dict() for s in sessions.values()]
+
+
+# --- HTTP Server ---
+
+class CloudHandler(http.server.BaseHTTPRequestHandler):
+    """Single HTTP handler for API, streaming, input, and viewer.
+
+    Routes:
+        GET  /api/sessions                  — list sessions
+        GET  /api/ping                      — health check
+        POST /api/sessions                  — create session
+        POST /api/sessions/<id>/build       — trigger build
+        POST /api/sessions/<id>/input       — send input event
+        POST /api/sessions/<id>/upload      — upload project zip
+        DELETE /api/sessions/<id>           — destroy session
+        DELETE /api/sessions                — destroy all sessions
+
+        GET  /sessions/<id>/stream          — MJPEG stream
+        GET  /sessions/<id>/                — viewer HTML
+        GET  /                              — session list / index
+    """
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+
+        if path == "/api/sessions":
+            self._json_response({"status": "ok", "sessions": list_sessions()})
+        elif path == "/api/ping":
+            self._json_response({"status": "ok", "message": "pong", "active_sessions": len(sessions)})
+        elif path.startswith("/sessions/") and path.endswith("/stream"):
+            session_id = path.split("/")[2]
+            self._serve_mjpeg(session_id)
+        elif path.startswith("/sessions/"):
+            session_id = path.split("/")[2]
+            self._serve_viewer(session_id)
+        elif path == "/":
+            self._serve_index()
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+
+        # Create session
+        if path == "/api/sessions":
+            body = self._read_json_body()
+            try:
+                session = create_session(
+                    project=body.get("project", "unknown"),
+                    branch=body.get("branch", "main"),
+                    device=body.get("device", "iPhone 16 Pro"),
+                    build_command=body.get("build_command"),
+                    runtime=body.get("runtime"),
+                )
+                self._json_response({"status": "ok", "session": session.to_dict()})
+            except Exception as e:
+                self._json_response({"status": "error", "message": str(e)}, code=500)
+
+        # Upload project zip to a specific session
+        elif path.startswith("/api/sessions/") and path.endswith("/upload"):
+            session_id = path.split("/")[3]
+            self._handle_upload(session_id)
+
+        # Build
+        elif path.startswith("/api/sessions/") and path.endswith("/build"):
+            body = self._read_json_body()
+            session_id = path.split("/")[3]
+            with sessions_lock:
+                session = sessions.get(session_id)
+            if not session:
+                self._json_response({"status": "error", "message": "Session not found"}, code=404)
+                return
+            success, output = run_build(session, body.get("command"))
+            self._json_response({
+                "status": "ok" if success else "error",
+                "build_success": success,
+                "output": output[-5000:] if output else "",
+            })
+
+        # Input
+        elif path.startswith("/api/sessions/") and path.endswith("/input"):
+            body = self._read_json_body()
+            session_id = path.split("/")[3]
+            with sessions_lock:
+                session = sessions.get(session_id)
+            if not session:
+                self._json_response({"status": "error", "message": "Session not found"}, code=404)
+                return
+            inject_input(session, body)
+            self._json_response({"status": "ok"})
+
+        else:
+            self.send_error(404)
+
+    def do_DELETE(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+
+        if path == "/api/sessions":
+            destroyed = []
+            with sessions_lock:
+                ids = list(sessions.keys())
+            for sid in ids:
+                destroy_session(sid)
+                destroyed.append(sid)
+            self._json_response({"status": "ok", "destroyed": destroyed})
+        elif path.startswith("/api/sessions/"):
+            session_id = path.split("/")[3]
+            success, message = destroy_session(session_id)
+            if success:
+                self._json_response({"status": "ok", "message": message})
+            else:
+                self._json_response({"status": "error", "message": message}, code=404)
+        else:
+            self.send_error(404)
+
+    # --- Helpers ---
+
+    def _read_json_body(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length == 0:
+            return {}
+        try:
+            return json.loads(self.rfile.read(length))
+        except (json.JSONDecodeError, Exception):
+            return {}
+
+    def _read_raw_body(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length == 0:
+            return b""
+        return self.rfile.read(length)
+
+    def _handle_upload(self, session_id):
+        """Receive a zip file and extract it to the session's project directory."""
+        with sessions_lock:
+            session = sessions.get(session_id)
+        if not session:
+            self._json_response({"status": "error", "message": "Session not found"}, code=404)
+            return
+
+        zip_data = self._read_raw_body()
+        if not zip_data:
+            self._json_response({"status": "error", "message": "Empty upload"}, code=400)
+            return
+
+        project_dir = session.project_dir
+        try:
+            if project_dir.exists():
+                shutil.rmtree(project_dir)
+            project_dir.mkdir(parents=True, exist_ok=True)
+
+            with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
+                zf.extractall(project_dir)
+
+            size_mb = len(zip_data) / (1024 * 1024)
+            print(f"[{session_id}] Upload: {size_mb:.1f} MB → {project_dir}")
+            self._json_response({
+                "status": "ok",
+                "project_dir": str(project_dir),
+                "size_bytes": len(zip_data),
+            })
+        except zipfile.BadZipFile:
+            self._json_response({"status": "error", "message": "Invalid zip file"}, code=400)
+        except Exception as e:
+            self._json_response({"status": "error", "message": str(e)}, code=500)
+
+    def _json_response(self, data, code=200):
+        body = json.dumps(data).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(body))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_mjpeg(self, session_id):
+        with sessions_lock:
+            session = sessions.get(session_id)
+        if not session:
+            self.send_error(404, "Session not found")
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        try:
+            while session.status == "running":
+                frame = None
+                with session.frame_lock:
+                    frame = session.latest_frame
+
+                if frame:
+                    self.wfile.write(b"--frame\r\n")
+                    self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                    self.wfile.write(f"Content-Length: {len(frame)}\r\n".encode())
+                    self.wfile.write(b"\r\n")
+                    self.wfile.write(frame)
+                    self.wfile.write(b"\r\n")
+                    self.wfile.flush()
+
+                time.sleep(1.0 / 30)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _serve_viewer(self, session_id):
+        with sessions_lock:
+            session = sessions.get(session_id)
+        if not session:
+            self.send_error(404, "Session not found")
+            return
+
+        script_dir = Path(__file__).parent.resolve()
+        viewer_path = script_dir / "vib-cloud-viewer.html"
+        if not viewer_path.exists():
+            viewer_path = Path("/usr/local/share/vib/vib-cloud-viewer.html")
+
+        if viewer_path.exists():
+            content = viewer_path.read_bytes()
+            content = content.replace(b"__SESSION_ID__", session_id.encode())
+        else:
+            content = f"""<!DOCTYPE html>
+<html><head><title>VIB Cloud - {session_id}</title></head>
+<body style="margin:0;background:#000;display:flex;justify-content:center;align-items:center;height:100vh">
+<img src="/sessions/{session_id}/stream" style="max-height:100vh;max-width:100vw">
+</body></html>""".encode()
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", len(content))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def _serve_index(self):
+        sess_list = list_sessions()
+        if not sess_list:
+            body = "<p>No active sessions.</p>"
+        else:
+            rows = ""
+            for s in sess_list:
+                sid = s["id"]
+                rows += (
+                    f'<tr><td><a href="/sessions/{sid}/">{sid}</a></td>'
+                    f'<td>{s.get("sim_device","?")}</td>'
+                    f'<td>{s.get("branch","?")}</td>'
+                    f'<td>{s.get("status","?")}</td></tr>\n'
+                )
+            body = f"<table><tr><th>Session</th><th>Device</th><th>Branch</th><th>Status</th></tr>{rows}</table>"
+
+        content = f"""<!DOCTYPE html>
+<html><head><title>VIB Cloud</title>
+<style>body{{font-family:sans-serif;padding:2em;background:#1a1a1a;color:#eee}}
+a{{color:#6cf}}table{{border-collapse:collapse}}th,td{{padding:8px 16px;text-align:left;border-bottom:1px solid #333}}</style>
+</head><body><h1>VIB Cloud Sessions</h1>{body}</body></html>""".encode()
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", len(content))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def log_message(self, format, *args):
+        path = args[0].split()[1] if args else ""
+        if "/stream" not in path and "/input" not in path:
+            http.server.BaseHTTPRequestHandler.log_message(self, format, *args)
+
+
+# --- Server Startup ---
+
+class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def load_existing_sessions():
+    if not VIB_SESSIONS_DIR.exists():
+        return
+    for entry in VIB_SESSIONS_DIR.iterdir():
+        if not entry.is_dir():
+            continue
+        meta_file = entry / "session.json"
+        if meta_file.exists():
+            try:
+                meta = json.loads(meta_file.read_text())
+                if meta.get("status") == "running":
+                    print(f"Found stale session {meta['id']}, cleaning up...")
+                    if meta.get("sim_udid"):
+                        shutdown_simulator(meta["sim_udid"])
+                        delete_simulator(meta["sim_udid"])
+                    shutil.rmtree(entry, ignore_errors=True)
+            except Exception as e:
+                print(f"Error loading session from {entry}: {e}")
+
+
+def run_server():
+    VIB_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    load_existing_sessions()
+
+    server = ThreadedHTTPServer(("0.0.0.0", SERVER_PORT), CloudHandler)
+    print(f"VIB Cloud Server listening on http://127.0.0.1:{SERVER_PORT}")
+    print(f"Sessions directory: {VIB_SESSIONS_DIR}")
+
+    stop_event = threading.Event()
+
+    def handle_signal(signum, frame):
+        print(f"\nReceived signal {signum}, shutting down...")
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    print("Press Ctrl+C to stop...")
+
+    try:
+        while not stop_event.is_set():
+            signal.pause()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print("Shutting down...")
+        server.shutdown()
+
+        with sessions_lock:
+            ids = list(sessions.keys())
+        for sid in ids:
+            try:
+                destroy_session(sid)
+            except Exception as e:
+                print(f"Error destroying session {sid}: {e}")
+
+        print("Server stopped.")
+
+
+if __name__ == "__main__":
+    run_server()
